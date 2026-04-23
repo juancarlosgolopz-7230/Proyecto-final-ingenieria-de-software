@@ -1,3 +1,4 @@
+import gc
 import network
 import socket
 from machine import Pin, time_pulse_us
@@ -18,9 +19,11 @@ distancia_minima = 999.0
 historial = [0] * 10 
 
 # --- WIFI AP ---
+from config import SSID, PASSWORD,PANEL_KEY
+
 ap = network.WLAN(network.AP_IF)
 ap.active(True)
-ap.config(essid="Radar_ESP32", password="")
+ap.config(essid=SSID,password=PASSWORD)
 
 # --- HTML (Con Círculos de Colores Dinámicos) ---
 def obtener_html():
@@ -93,24 +96,68 @@ def obtener_html():
 # --- SERVIDOR WEB ---
 def servidor_web():
     global distancia_minima
+    sesiones = []  # IPs autorizadas
+
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(('', 80))
     s.listen(1)
+
+    login_html = """<!DOCTYPE html><html><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+    body{margin:0;font-family:sans-serif;background:#121212;color:white;
+         display:flex;justify-content:center;align-items:center;
+         height:100vh;flex-direction:column;}
+    input{padding:14px;font-size:18px;border-radius:10px;border:none;
+          width:240px;text-align:center;margin:10px 0;background:#1e1e1e;
+          color:white;border:2px solid #333;}
+    button{padding:14px 40px;font-size:18px;border-radius:10px;
+           border:none;background:#00e676;color:black;cursor:pointer;
+           font-weight:bold;}
+    </style></head><body>
+    <h2>RADAR ESP32</h2>
+    <p>Ingrese la clave de acceso</p>
+    <input type="password" id="k" placeholder="Clave">
+    <button onclick="location.href='/?clave='+document.getElementById('k').value">
+    Entrar</button>
+    </body></html>"""
+
     while True:
         try:
             conn, addr = s.accept()
             request = conn.recv(1024).decode()
+            ip = str(addr[0])
+
+            # Verificar si envían clave de acceso
+            if "clave=" in request:
+                clave = request.split("clave=")[1].split(" ")[0].split("&")[0]
+                if clave == PANEL_KEY:
+                    if ip not in sesiones:
+                        sesiones.append(ip)
+
+            # Si NO está autorizado, mostrar login
+            if ip not in sesiones:
+                conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n')
+                conn.sendall(login_html)
+                conn.close()
+                gc.collect()
+                continue
+
+            # --- Cliente autorizado ---
             if '/update' in request:
                 res = '{"d":' + str(distancia_actual) + ',"m":' + str(distancia_minima) + ',"h":' + str(historial) + '}'
-                conn.send('HTTP/1.1 200 OK\nContent-Type: application/json\n\n' + res)
+                conn.send('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n' + res)
             elif '/reset' in request:
                 distancia_minima = 999.0
-                conn.send('HTTP/1.1 200 OK\n\nOK')
+                conn.send('HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK')
             else:
-                conn.send('HTTP/1.1 200 OK\nContent-Type: text/html\n\n' + obtener_html())
+                conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n' + obtener_html())
+
             conn.close()
-        except: pass
+            gc.collect()
+        except Exception as e:
+            print("Error:", e)
 
 _thread.start_new_thread(servidor_web, ())
 
@@ -135,7 +182,7 @@ while True:
     if dist > 30:
         led_verde.on(); led_amarillo.off(); led_rojo.off()
         buzzer.on(); time.sleep(0.1); buzzer.off(); time.sleep(0.5)
-    elif dist > 15:
+    elif dist > 5:
         led_verde.off(); led_amarillo.on(); led_rojo.off()
         buzzer.on(); time.sleep(0.1); buzzer.off(); time.sleep(0.1)
     else:
