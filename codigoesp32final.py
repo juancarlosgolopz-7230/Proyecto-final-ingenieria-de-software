@@ -1,0 +1,200 @@
+import gc
+import network
+import socket
+from machine import Pin, time_pulse_us
+import time
+import _thread
+
+# --- HARDWARE ---
+led_verde = Pin(13, Pin.OUT)
+led_amarillo = Pin(12, Pin.OUT)
+led_rojo = Pin(14, Pin.OUT)
+buzzer = Pin(27, Pin.OUT)
+trig = Pin(5, Pin.OUT)
+echo = Pin(18, Pin.IN)
+
+# --- VARIABLES ---
+distancia_actual = 0.0
+distancia_minima = 999.0
+historial = [0] * 10 
+
+# --- WIFI AP ---
+from config import SSID, PASSWORD,PANEL_KEY
+
+ap = network.WLAN(network.AP_IF)
+ap.active(True)
+ap.config(essid=SSID,password=PASSWORD,authmode=3)
+
+# --- HTML (Con Círculos de Colores Dinámicos) ---
+def obtener_html():
+    return """<!DOCTYPE html><html><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: sans-serif; text-align: center; background: #121212; color: white; }
+        .card { background: #1e1e1e; padding: 20px; border-radius: 15px; display: inline-block; margin-top: 20px; width: 90%; }
+        .dato { font-size: 3em; color: #00e676; font-weight: bold; }
+        
+        /* Estilo de los círculos indicadores */
+        .indicadores { margin: 20px 0; }
+        .circulo { width: 40px; height: 40px; border-radius: 50%; display: inline-block; margin: 0 10px; background: #333; transition: 0.2s; border: 2px solid #555; }
+        
+        svg { background: #000; border-radius: 10px; width: 100%; height: 150px; margin-bottom: 15px; }
+        polyline { fill: none; stroke: #00e676; stroke-width: 3; }
+        .bar-container { background: #333; height: 20px; border-radius: 10px; margin: 20px 0; overflow: hidden; }
+        #bar { background: #00e676; height: 100%; width: 0%; transition: width 0.2s; }
+        button { background: #d32f2f; color: white; border: none; padding: 15px; border-radius: 8px; width: 100%; font-size: 16px; }
+    </style></head><body>
+    <div class="card">
+        <h1>RADAR ESP32</h1>
+        
+        <div class="indicadores">
+            <div id="cV" class="circulo"></div>
+            <div id="cA" class="circulo"></div>
+            <div id="cR" class="circulo"></div>
+        </div>
+
+        <div id="dist" class="dato">0.0 cm</div>
+        
+        <svg viewBox="0 0 100 100" preserveAspectRatio="none">
+            <polyline id="linea" points="0,100 100,100"/>
+        </svg>
+
+        <div class="bar-container"><div id="bar"></div></div>
+        <p>Mínima: <span id="min">999</span> cm</p>
+        <button onclick="fetch('/reset')">CALIBRAR / RESET</button>
+    </div>
+    <script>
+        setInterval(() => {
+            fetch('/update').then(r => r.json()).then(data => {
+                let d = data.d;
+                document.getElementById('dist').innerText = d.toFixed(1) + " cm";
+                document.getElementById('min').innerText = data.m.toFixed(1);
+                
+                // Actualizar barra
+                document.getElementById('bar').style.width = Math.min(d, 100) + "%";
+                
+                // Lógica de los Círculos en el Celular
+                document.getElementById('cV').style.background = (d > 30) ? "#00ff00" : "#333";
+                document.getElementById('cA').style.background = (d <= 30 && d > 15) ? "#ffff00" : "#333";
+                document.getElementById('cR').style.background = (d <= 15) ? "#ff0000" : "#333";
+                
+                // Sombras de luz (glow)
+                document.getElementById('cV').style.boxShadow = (d > 30) ? "0 0 15px #00ff00" : "none";
+                document.getElementById('cA').style.boxShadow = (d <= 30 && d > 15) ? "0 0 15px #ffff00" : "none";
+                document.getElementById('cR').style.boxShadow = (d <= 15) ? "0 0 15px #ff0000" : "none";
+
+                // Gráfica
+                let pts = "";
+                for(let i=0; i<data.h.length; i++){
+                    pts += (i * 11.1) + "," + (100 - Math.min(data.h[i], 100)) + " ";
+                }
+                document.getElementById('linea').setAttribute("points", pts);
+            }).catch(e => {});
+        }, 500);
+    </script></body></html>"""
+
+# --- SERVIDOR WEB ---
+def servidor_web():
+    global distancia_minima
+    sesiones = []  # IPs autorizadas
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('', 80))
+    s.listen(1)
+
+    login_html = """<!DOCTYPE html><html><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+    body{margin:0;font-family:sans-serif;background:#121212;color:white;
+         display:flex;justify-content:center;align-items:center;
+         height:100vh;flex-direction:column;}
+    input{padding:14px;font-size:18px;border-radius:10px;border:none;
+          width:240px;text-align:center;margin:10px 0;background:#1e1e1e;
+          color:white;border:2px solid #333;}
+    button{padding:14px 40px;font-size:18px;border-radius:10px;
+           border:none;background:#00e676;color:black;cursor:pointer;
+           font-weight:bold;}
+    </style></head><body>
+    <h2>RADAR ESP32</h2>
+    <p>Ingrese la clave de acceso</p>
+    <input type="password" id="k" placeholder="Clave">
+    <button onclick="location.href='/?clave='+document.getElementById('k').value">
+    Entrar</button>
+    </body></html>"""
+
+    while True:
+        try:
+            conn, addr = s.accept()
+            request = conn.recv(1024).decode()
+            ip = str(addr[0])
+
+            # Verificar si envían clave de acceso
+            if "clave=" in request:
+                clave = request.split("clave=")[1].split(" ")[0].split("&")[0]
+                if clave == PANEL_KEY:
+                    if ip not in sesiones:
+                        sesiones.append(ip)
+
+            # Si NO está autorizado, mostrar login
+            if ip not in sesiones:
+                conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n')
+                conn.sendall(login_html)
+                conn.close()
+                gc.collect()
+                continue
+
+            # --- Cliente autorizado ---
+            if '/update' in request:
+                res = '{"d":' + str(distancia_actual) + ',"m":' + str(distancia_minima) + ',"h":' + str(historial) + '}'
+                conn.send('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n' + res)
+            elif '/reset' in request:
+                distancia_minima = 999.0
+                conn.send('HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK')
+            else:
+                conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n' + obtener_html())
+
+            conn.close()
+            gc.collect()
+        except Exception as e:
+            print("Error:", e)
+
+_thread.start_new_thread(servidor_web, ())
+
+# --- BUCLE PRINCIPAL (Tu lógica original intacta) ---
+while True:
+    trig.off()
+    time.sleep_us(2)
+    trig.on()
+    time.sleep_us(10)
+    trig.off()
+    dur = time_pulse_us(echo, 1, 30000)
+    dist = (dur * 0.0343) / 2 if dur > 0 else 400.0
+    distancia_actual = dist
+    
+    historial.pop(0)
+    historial.append(dist)
+    
+    if dist < distancia_minima:
+        distancia_minima = dist
+
+     # --- ALERTAS FÍSICAS ACTUALIZADAS ---
+    if dist > 35:
+        # Off: > 35 cm
+        led_verde.off(); led_amarillo.off(); led_rojo.off()
+        buzzer.off()
+        time.sleep(0.6) 
+    elif dist >= 25: 
+        # Verde: 35 a 25 cm (Lento)
+        led_verde.on(); led_amarillo.off(); led_rojo.off()
+        buzzer.on(); time.sleep(0.2); buzzer.off(); time.sleep(0.4)
+    elif dist >= 10: 
+        # Amarillo: 25 a 10 cm (Medio)
+        led_verde.off(); led_amarillo.on(); led_rojo.off()
+        buzzer.on(); time.sleep(0.1); buzzer.off(); time.sleep(0.2)
+    else: 
+        # Rojo: < 10 cm (Rápido)
+        led_verde.off(); led_amarillo.off(); led_rojo.on()
+        buzzer.on(); time.sleep(0.05); buzzer.off(); time.sleep(0.05)
+    
+    
